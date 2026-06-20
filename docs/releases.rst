@@ -163,7 +163,14 @@ New configuration options
 ``b4.send-me-too``
   Set to ``no`` to suppress including your own address in the ``Cc``
   when sending patches with ``b4 send``. Defaults to ``yes`` (include
-  yourself).
+  yourself), unless ``b4.outbox-maildir`` is set and this option is not
+  explicitly configured.
+
+``b4.outbox-maildir``
+  Optional local Maildir where ``b4 send`` records exact sent-message
+  bytes after the selected transport accepts them. Missing Maildirs are
+  created, invalid destinations abort before sending, and post-send
+  archive failures warn without changing the sent count.
 
 Native history rewriting (replaces ``git-filter-repo``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -406,4 +413,3 @@ reviewing patches, testing, and contributing code:
 - Rob Herring
 - Tamir Duberstein
 - Toke Høiland-Jørgensen
-

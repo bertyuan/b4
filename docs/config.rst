@@ -765,9 +765,29 @@ Contributor-oriented settings
 
    :term:`b4.send-me-too`
      Instructs b4 to include your own address when sending. Set by default,
-     use ``no`` to suppress sending to yourself.
+     use ``no`` to suppress sending to yourself. When
+     :term:`b4.outbox-maildir` is configured and this option is not explicitly
+     set, b4 acts as if this were ``no`` because a local sent copy is already
+     saved.
 
-     Default: ``yes``
+     Default: automatic (``yes`` unless :term:`b4.outbox-maildir` is set)
+
+     .. versionadded:: v0.16
+
+   :term:`b4.outbox-maildir`
+     Optional local Maildir where ``b4 send`` stores a copy of every message
+     accepted by the selected transport. The path may use ``~`` and
+     environment variables. If it does not exist, b4 creates it as one Maildir
+     mailbox with ``cur``, ``new``, and ``tmp`` subdirectories. If the path
+     already exists but is not a valid Maildir, sending aborts before any
+     message is transmitted.
+
+     Sent copies are written as already-read messages in ``cur`` with the
+     Maildir ``S`` flag. This option is ignored by repository-provided
+     ``.b4-config`` files; set it in system, global, or repository Git config,
+     or with ``-c/--config``.
+
+     Default: ``None``
 
      .. versionadded:: v0.16
 

@@ -222,6 +222,47 @@ This generates the messages and writes them out into the directory
 provided, giving you a way to verify that everything is looking as it
 should before sending.
 
+Saving sent copies to a local Maildir
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+By default, ``b4 send`` does not save local sent-message copies. You can
+opt in by configuring one Maildir mailbox:
+
+::
+
+    [b4]
+        outbox-maildir = ~/Mail/b4-sent
+
+The configured path is the Maildir itself, not a directory containing
+multiple mailboxes. B4 expands ``~`` and environment variables in this
+path. If the Maildir does not exist, b4 creates the ``cur``, ``new``,
+and ``tmp`` directories. If the path already exists but is not a valid
+Maildir, or cannot be written, ``b4 send`` aborts before transmitting
+any messages.
+
+Messages are saved only after the selected transport accepts them: after
+the local sendmail-compatible command succeeds, after ``smtp.sendmail()``
+succeeds, or after the web endpoint returns success for the submitted
+batch. Saved messages are written as already-read Maildir entries in
+``cur`` with the ``S`` flag.
+
+When ``b4.outbox-maildir`` is configured and :term:`b4.send-me-too` is
+not explicitly set, b4 no longer adds your own address as a recipient.
+Set ``b4.send-me-too = yes`` to keep receiving a delivered copy in
+addition to the local Maildir copy, or use ``--not-me-too`` or
+``b4.send-me-too = no`` to force exclusion.
+
+Dry-run and ``--output-dir`` modes do not save Maildir copies because no
+messages are transmitted. Real transmissions made with ``--reflect``,
+``--preview-to``, or ``--resend`` are saved because they are outgoing
+messages accepted by a transport. For the web endpoint, the saved copy is
+the exact message submitted by local b4; the final delivered message can
+differ if the endpoint performs From/DMARC rewriting.
+
+If a message has already been accepted but writing the local Maildir copy
+fails, b4 logs a warning and still reports the message as sent. This
+avoids prompting you to resend mail that was already accepted by the
+transport.
+
 Checking things over with ``--reflect``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 One final test you can do before you submit your series is to send
@@ -340,4 +381,3 @@ Command line flags
 
 ``--resend V``
   Resend the specified previously sent version.
-
