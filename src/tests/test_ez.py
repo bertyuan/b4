@@ -1,4 +1,7 @@
+import email.utils
+import logging
 import os
+import pathlib
 from email.message import EmailMessage
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple, cast
 from unittest.mock import patch
@@ -1080,3 +1083,208 @@ def test_trailers_fuzzy_composes_with_interactive(
     # ...and, having been accepted there, it landed on the commit.
     _ec, logstr = b4.git_run_command(None, ['log', '--format=%b', 'HEAD~4..'])
     assert 'Follow Upper' in logstr
+
+
+def _cmd_send_message() -> EmailMessage:
+    msg = EmailMessage()
+    msg['From'] = 'Test Override <test-override@example.com>'
+    msg['Subject'] = '[PATCH] outbox default test'
+    msg['Message-Id'] = '<outbox-default-test@example.com>'
+    msg.set_payload('Test body\n')
+    return msg
+
+
+def _recipient_addrs(msg: EmailMessage) -> Set[str]:
+    addrs = email.utils.getaddresses(
+        [str(x) for x in msg.get_all('to', []) + msg.get_all('cc', [])]
+    )
+    return {addr for _name, addr in addrs}
+
+
+def _run_cmd_send_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    send_args: List[str],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[EmailMessage], Dict[str, Any]]:
+    if config:
+        b4.MAIN_CONFIG.update(config)
+
+    parser = b4.command.setup_parser()
+    cmdargs = parser.parse_args(
+        ['--no-stdin', '--no-interactive', '--offline-mode', 'send'] + send_args
+    )
+    patch_msg = _cmd_send_message()
+    captured: List[EmailMessage] = list()
+    captured_kwargs: Dict[str, Any] = dict()
+
+    def fake_cleanup(
+        addresses: List[Tuple[str, str]], excludes: Set[str], _gitdir: Optional[str]
+    ) -> List[Tuple[str, str]]:
+        return [addr for addr in addresses if addr[1] not in excludes]
+
+    def fake_get_patches(
+        *_args: Any, **_kwargs: Any
+    ) -> Tuple[
+        List[Tuple[str, str]],
+        List[Tuple[str, str]],
+        str,
+        List[Tuple[Optional[str], EmailMessage]],
+    ]:
+        return (
+            [('Maintainer', 'maintainer@example.com')],
+            [('Sender', 'test-override@example.com')],
+            'tag message',
+            [(None, patch_msg)],
+        )
+
+    def fake_send_mail(*_args: Any, **kwargs: Any) -> int:
+        captured.extend(_args[1])
+        captured_kwargs.update(kwargs)
+        return len(captured)
+
+    monkeypatch.setattr(b4, 'git_get_current_branch', lambda: 'b4/test')
+    monkeypatch.setattr(b4.ez, 'is_prep_branch', lambda mustbe=False: None)
+    monkeypatch.setattr(
+        b4.ez,
+        'load_cover',
+        lambda strip_comments=True: (
+            '',
+            {'series': {'revision': 1, 'change-id': 'test-change'}},
+        ),
+    )
+    monkeypatch.setattr(b4, 'git_get_repo_status', lambda: [])
+    monkeypatch.setattr(b4.ez, 'get_prep_branch_as_patches', fake_get_patches)
+    monkeypatch.setattr(
+        b4.ez,
+        'get_info',
+        lambda usebranch=None: {
+            'needs-editing': False,
+            'needs-checking': False,
+            'needs-checking-deps': False,
+            'needs-auto-to-cc': False,
+            'misplaced-body': False,
+        },
+    )
+    monkeypatch.setattr(b4, 'cleanup_email_addrs', fake_cleanup)
+    monkeypatch.setattr(
+        b4,
+        'get_sendemail_config',
+        lambda: {'smtpserver': 'smtp.example.com'},
+    )
+    monkeypatch.setattr(
+        b4,
+        'get_smtp',
+        lambda dryrun=False: (None, 'test-override@example.com'),
+    )
+    monkeypatch.setattr(b4, 'send_mail', fake_send_mail)
+    monkeypatch.setattr('builtins.input', lambda _prompt='': '')
+
+    b4.ez.cmd_send(cmdargs)
+    return captured, captured_kwargs
+
+
+def test_cmd_send_without_outbox_unset_send_me_too_includes_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured, _kwargs = _run_cmd_send_capture(monkeypatch, ['--dry-run', '--no-sign'])
+
+    assert len(captured) == 1
+    assert 'test-override@example.com' in _recipient_addrs(captured[0])
+
+
+def test_cmd_send_with_outbox_unset_send_me_too_excludes_sender(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _kwargs = _run_cmd_send_capture(
+        monkeypatch,
+        ['--dry-run', '--no-sign'],
+        {'outbox-maildir': str(tmp_path / 'sent')},
+    )
+
+    assert len(captured) == 1
+    assert 'test-override@example.com' not in _recipient_addrs(captured[0])
+
+
+def test_cmd_send_with_outbox_explicit_send_me_too_yes_includes_sender(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured, _kwargs = _run_cmd_send_capture(
+        monkeypatch,
+        ['--dry-run', '--no-sign'],
+        {'outbox-maildir': str(tmp_path / 'sent'), 'send-me-too': 'yes'},
+    )
+
+    assert len(captured) == 1
+    assert 'test-override@example.com' in _recipient_addrs(captured[0])
+
+
+@pytest.mark.parametrize(
+    'config,send_args',
+    [
+        ({'send-me-too': 'no'}, ['--dry-run', '--no-sign']),
+        ({}, ['--dry-run', '--no-sign', '--not-me-too']),
+    ],
+)
+def test_cmd_send_explicit_no_and_not_me_too_exclude_sender(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Dict[str, Any],
+    send_args: List[str],
+) -> None:
+    captured, _kwargs = _run_cmd_send_capture(monkeypatch, send_args, config)
+
+    assert len(captured) == 1
+    assert 'test-override@example.com' not in _recipient_addrs(captured[0])
+
+
+def test_b4_config_send_me_too_is_explicit_but_outbox_maildir_is_ignored(
+    gitdir: str, tmp_path: pathlib.Path
+) -> None:
+    with open(os.path.join(gitdir, '.b4-config'), 'w') as fh:
+        fh.write(
+            '[b4]\n'
+            '    send-me-too = yes\n'
+            '    outbox-maildir = /tmp/repo-controlled-outbox\n'
+        )
+
+    parser = b4.command.setup_parser()
+    cmdargs = parser.parse_args(['--no-stdin', 'send', '--dry-run'])
+    b4._setup_main_config(cmdargs)
+    assert b4.MAIN_CONFIG['send-me-too'] == 'yes'
+    assert b4.MAIN_CONFIG.get('outbox-maildir') is None
+
+    git_outbox = tmp_path / 'git-outbox'
+    b4.git_set_config(gitdir, 'b4.outbox-maildir', str(git_outbox))
+    b4._setup_main_config(cmdargs)
+    assert b4.MAIN_CONFIG['outbox-maildir'] == str(git_outbox)
+
+    cli_outbox = tmp_path / 'cli-outbox'
+    cmdargs = parser.parse_args(
+        [
+            '--no-stdin',
+            '--config',
+            f'b4.outbox-maildir={cli_outbox}',
+            'send',
+            '--dry-run',
+        ]
+    )
+    b4._setup_main_config(cmdargs)
+    assert b4.MAIN_CONFIG['outbox-maildir'] == str(cli_outbox)
+
+
+def test_cmd_send_summary_includes_resolved_outbox_path(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outbox = tmp_path / 'sent'
+    caplog.set_level(logging.INFO, logger='b4')
+
+    _captured, kwargs = _run_cmd_send_capture(
+        monkeypatch,
+        ['--reflect', '--no-sign'],
+        {'outbox-maildir': str(outbox)},
+    )
+
+    assert kwargs['archive_cb'] is not None
+    assert f'archive sent copies to Maildir: {outbox}' in caplog.text
+    assert 'not send a separate copy to yourself' in caplog.text

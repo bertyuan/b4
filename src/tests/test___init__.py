@@ -4,10 +4,12 @@ import email.parser
 import email.policy
 import email.utils
 import io
+import logging
 import os
 import pathlib
+import smtplib
 import socket
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple, cast
 
 import pytest
 
@@ -1174,3 +1176,348 @@ def test_map_codereview_trailers_exposes_parent_patches(sampledir: str) -> None:
     parent = parent_patches[patchid]
     assert parent.subject == 'Minor typo changes imitation'
     assert parent.msgid == '20221025-test1-v1-4-e4f28f57990c@linuxfoundation.org'
+
+
+def _outbox_msg(subject: str = 'outbox test') -> email.message.EmailMessage:
+    msg = email.message.EmailMessage()
+    msg['From'] = 'Sender <sender@example.com>'
+    msg['To'] = 'Recipient <recipient@example.com>'
+    msg['Subject'] = subject
+    msg['Message-Id'] = f'<{subject.replace(" ", "-")}@example.com>'
+    msg.set_payload('Body\n')
+    return msg
+
+
+def _archive_to(dest: pathlib.Path) -> b4.ArchiveCallbackT:
+    def archive(bdata: bytes, _lsubject: b4.LoreSubject) -> None:
+        b4.save_maildir_bytes(str(dest), bdata)
+
+    return archive
+
+
+def _cur_files(dest: pathlib.Path) -> List[pathlib.Path]:
+    return sorted((dest / 'cur').iterdir())
+
+
+class _FakeSmtp:
+    def __init__(self, fail_after: Optional[int] = None) -> None:
+        self.fail_after = fail_after
+        self.sent: List[Tuple[str, List[str], bytes]] = list()
+
+    def sendmail(self, fromaddr: str, destaddrs: List[str], bdata: bytes) -> None:
+        if self.fail_after is not None and len(self.sent) >= self.fail_after:
+            raise smtplib.SMTPException('smtp boom')
+        self.sent.append((fromaddr, destaddrs, bdata))
+
+
+class _FakeResp:
+    text = 'fake response'
+
+    def __init__(self, payload: Dict[str, str]) -> None:
+        self.payload = payload
+
+    def json(self) -> Dict[str, str]:
+        return self.payload
+
+
+class _FakeSession:
+    def __init__(self, payload: Dict[str, str]) -> None:
+        self.payload = payload
+        self.posts: List[Tuple[str, Dict[str, Any]]] = list()
+
+    def post(self, url: str, json: Dict[str, Any]) -> _FakeResp:
+        self.posts.append((url, json))
+        return _FakeResp(self.payload)
+
+
+def test_outbox_maildir_path_expansion(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / 'home'
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('B4_OUTBOX_LEAF', 'b4-sent')
+
+    assert b4.expand_maildir_path('~/Mail/$B4_OUTBOX_LEAF') == str(
+        home / 'Mail' / 'b4-sent'
+    )
+
+
+def test_prepare_outbox_maildir_creates_missing_maildir(
+    tmp_path: pathlib.Path,
+) -> None:
+    dest = tmp_path / 'sent'
+
+    resolved = b4.prepare_outbox_maildir(str(dest))
+
+    assert resolved == str(dest)
+    assert b4.is_maildir(str(dest))
+    assert _cur_files(dest) == []
+
+
+def test_prepare_outbox_maildir_rejects_existing_non_maildir(
+    tmp_path: pathlib.Path,
+) -> None:
+    dest = tmp_path / 'not-maildir'
+    dest.mkdir()
+
+    with pytest.raises(RuntimeError, match='not a valid Maildir'):
+        b4.prepare_outbox_maildir(str(dest))
+
+
+def test_send_mail_local_command_archives_success(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    calls: List[Tuple[List[str], bytes]] = list()
+
+    def fake_run(cmdargs: List[str], stdin: bytes) -> Tuple[int, bytes, bytes]:
+        calls.append((cmdargs, stdin))
+        return 0, b'', b''
+
+    monkeypatch.setattr(b4, '_run_command', fake_run)
+
+    sent = b4.send_mail(
+        ['/usr/sbin/sendmail'],
+        [_outbox_msg()],
+        fromaddr='sender@example.com',
+        archive_cb=_archive_to(outbox),
+    )
+
+    assert sent == 1
+    assert len(calls) == 1
+    stored = _cur_files(outbox)
+    assert len(stored) == 1
+    assert stored[0].name.endswith(':2,S')
+    assert stored[0].read_bytes() == calls[0][1]
+
+
+def test_send_mail_smtp_archives_success(tmp_path: pathlib.Path) -> None:
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    smtp = _FakeSmtp()
+
+    sent = b4.send_mail(
+        cast(smtplib.SMTP, smtp),
+        [_outbox_msg()],
+        fromaddr='sender@example.com',
+        archive_cb=_archive_to(outbox),
+    )
+
+    assert sent == 1
+    assert len(smtp.sent) == 1
+    stored = _cur_files(outbox)
+    assert len(stored) == 1
+    assert stored[0].read_bytes() == smtp.sent[0][2]
+
+
+def test_send_mail_local_partial_failure_archives_only_sent(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    calls = 0
+
+    def fake_run(_cmdargs: List[str], stdin: bytes) -> Tuple[int, bytes, bytes]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return 1, b'', b'local boom'
+        return 0, b'', b''
+
+    monkeypatch.setattr(b4, '_run_command', fake_run)
+
+    with pytest.raises(RuntimeError, match='local boom'):
+        b4.send_mail(
+            ['/usr/sbin/sendmail'],
+            [_outbox_msg('one'), _outbox_msg('two')],
+            fromaddr='sender@example.com',
+            archive_cb=_archive_to(outbox),
+        )
+
+    assert calls == 2
+    assert len(_cur_files(outbox)) == 1
+
+
+def test_send_mail_smtp_partial_failure_archives_only_sent(
+    tmp_path: pathlib.Path,
+) -> None:
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    smtp = _FakeSmtp(fail_after=1)
+
+    with pytest.raises(smtplib.SMTPException, match='smtp boom'):
+        b4.send_mail(
+            cast(smtplib.SMTP, smtp),
+            [_outbox_msg('one'), _outbox_msg('two')],
+            fromaddr='sender@example.com',
+            archive_cb=_archive_to(outbox),
+        )
+
+    assert len(smtp.sent) == 1
+    assert len(_cur_files(outbox)) == 1
+
+
+def test_send_mail_web_success_archives_all(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    session = _FakeSession({'result': 'success'})
+    monkeypatch.setattr(b4, 'get_requests_session', lambda: session)
+
+    sent = b4.send_mail(
+        None,
+        [_outbox_msg('one'), _outbox_msg('two')],
+        fromaddr=None,
+        web_endpoint='https://example.test/_b4_submit',
+        archive_cb=_archive_to(outbox),
+    )
+
+    assert sent == 2
+    assert len(session.posts) == 1
+    assert len(_cur_files(outbox)) == 2
+
+
+def test_send_mail_web_failure_archives_none(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    session = _FakeSession({'result': 'error', 'message': 'nope'})
+    monkeypatch.setattr(b4, 'get_requests_session', lambda: session)
+
+    sent = b4.send_mail(
+        None,
+        [_outbox_msg()],
+        fromaddr=None,
+        web_endpoint='https://example.test/_b4_submit',
+        archive_cb=_archive_to(outbox),
+    )
+
+    assert sent == 0
+    assert _cur_files(outbox) == []
+
+
+def test_send_mail_dryrun_and_output_dir_archive_none(
+    tmp_path: pathlib.Path,
+) -> None:
+    archived: List[bytes] = list()
+    outdir = tmp_path / 'out'
+    outdir.mkdir()
+
+    dryrun_sent = b4.send_mail(
+        ['/usr/sbin/sendmail'],
+        [_outbox_msg('dryrun')],
+        fromaddr='sender@example.com',
+        dryrun=True,
+        archive_cb=lambda bdata, _lsubject: archived.append(bdata),
+    )
+    output_sent = b4.send_mail(
+        ['/usr/sbin/sendmail'],
+        [_outbox_msg('output')],
+        fromaddr='sender@example.com',
+        output_dir=str(outdir),
+        archive_cb=lambda bdata, _lsubject: archived.append(bdata),
+    )
+
+    assert dryrun_sent == 0
+    assert output_sent == 0
+    assert archived == []
+
+
+def test_send_mail_outbox_write_failure_warns_without_changing_count(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(b4, '_run_command', lambda _cmdargs, stdin: (0, b'', b''))
+
+    def fail_archive(_bdata: bytes, _lsubject: b4.LoreSubject) -> None:
+        raise OSError('disk full')
+
+    caplog.set_level(logging.WARNING, logger='b4')
+    sent = b4.send_mail(
+        ['/usr/sbin/sendmail'],
+        [_outbox_msg()],
+        fromaddr='sender@example.com',
+        archive_cb=fail_archive,
+    )
+
+    assert sent == 1
+    assert 'could not archive it to the outbox' in caplog.text
+    assert 'disk full' in caplog.text
+
+
+def test_save_maildir_bytes_marks_seen_and_preserves_rfc822_bytes(
+    tmp_path: pathlib.Path,
+) -> None:
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    raw = (
+        b'From: Sender <sender@example.com>\n'
+        b'To: Recipient <recipient@example.com>\n'
+        b'Subject: preserved\n'
+        b'X-Developer-Signature: v=1; a=test;\n'
+        b' folded=yes\n'
+        b'\n'
+        b'Body\n'
+    )
+
+    stored = pathlib.Path(b4.save_maildir_bytes(str(outbox), raw))
+    parsed = email.parser.BytesParser(
+        policy=b4.emlpolicy, _class=email.message.EmailMessage
+    ).parsebytes(stored.read_bytes())
+
+    assert stored.parent == outbox / 'cur'
+    assert stored.name.endswith(':2,S')
+    assert stored.read_bytes() == raw
+    assert parsed['Subject'] == 'preserved'
+
+
+def test_send_mail_archives_exact_patatt_signed_bytes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import patatt
+
+    outbox = tmp_path / 'sent'
+    b4.prepare_outbox_maildir(str(outbox))
+    signed: Dict[str, bytes] = dict()
+    monkeypatch.setattr(b4, '_run_command', lambda _cmdargs, stdin: (0, b'', b''))
+
+    def fake_sign(bdata: bytes) -> bytes:
+        signed['data'] = b'X-Developer-Signature: v=1; a=test;\n folded=yes\n' + bdata
+        return signed['data']
+
+    monkeypatch.setattr(patatt, 'rfc2822_sign', fake_sign)
+
+    sent = b4.send_mail(
+        ['/usr/sbin/sendmail'],
+        [_outbox_msg()],
+        fromaddr='sender@example.com',
+        patatt_sign=True,
+        archive_cb=_archive_to(outbox),
+    )
+
+    assert sent == 1
+    assert _cur_files(outbox)[0].read_bytes() == signed['data']
+
+
+def test_send_mail_without_archive_callback_remains_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_run(_cmdargs: List[str], stdin: bytes) -> Tuple[int, bytes, bytes]:
+        nonlocal calls
+        calls += 1
+        return 0, b'', b''
+
+    monkeypatch.setattr(b4, '_run_command', fake_run)
+
+    sent = b4.send_mail(
+        ['/usr/sbin/sendmail'],
+        [_outbox_msg()],
+        fromaddr='sender@example.com',
+    )
+
+    assert sent == 1
+    assert calls == 1
