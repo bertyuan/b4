@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import smtplib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,7 @@ from pathlib import Path
 from typing import (
     Any,
     BinaryIO,
+    Callable,
     Dict,
     Generator,
     Iterator,
@@ -177,8 +179,10 @@ DEFAULT_CONFIG: ConfigDictT = {
     'review-target-branch': None,
     # Do not patatt-sign outgoing review emails
     'review-no-patatt-sign': None,
-    # Send to myself
-    'send-me-too': 'yes',
+    # Send to myself. None means automatic for b4 send.
+    'send-me-too': None,
+    # Local Maildir for b4 send sent-message copies
+    'outbox-maildir': None,
     # Command whose stdout is used as the Message-Id for replies and notifications
     # (review replies, follow-up replies, and thank-you notes). Series patches sent
     # with "b4 prep/send" keep their templated message-ids and are not affected.
@@ -4743,6 +4747,84 @@ def save_maildir(msgs: List[EmailMessage], dest: str) -> None:
         )
 
 
+def expand_maildir_path(dest: str) -> str:
+    expanded = os.path.expanduser(os.path.expandvars(dest))
+    return os.path.abspath(expanded)
+
+
+def _make_maildir_name() -> str:
+    host = re.sub(r'[^A-Za-z0-9_.-]+', '_', socket.gethostname() or 'localhost')
+    return f'{time.time_ns()}.M{time.monotonic_ns()}P{os.getpid()}.{host}'
+
+
+def save_maildir_bytes(dest: str, bdata: bytes) -> str:
+    d_tmp = os.path.join(dest, 'tmp')
+    d_cur = os.path.join(dest, 'cur')
+    last_err: Optional[Exception] = None
+
+    for _attempt in range(10):
+        fname = _make_maildir_name()
+        tmpname = os.path.join(d_tmp, fname)
+        curname = os.path.join(d_cur, f'{fname}:2,S')
+        created_tmp = False
+        try:
+            with open(tmpname, 'xb') as mfh:
+                created_tmp = True
+                mfh.write(bdata)
+                mfh.flush()
+                os.fsync(mfh.fileno())
+            os.link(tmpname, curname)
+            os.unlink(tmpname)
+            return curname
+        except FileExistsError as ex:
+            last_err = ex
+            if created_tmp:
+                try:
+                    os.unlink(tmpname)
+                except OSError:
+                    pass
+            continue
+        except OSError:
+            try:
+                os.unlink(tmpname)
+            except OSError:
+                pass
+            raise
+
+    raise RuntimeError(f'could not create unique Maildir filename: {last_err}')
+
+
+def prepare_outbox_maildir(dest: str) -> str:
+    if not dest.strip():
+        raise RuntimeError('b4.outbox-maildir resolves to an empty path')
+    resolved = expand_maildir_path(dest)
+
+    if os.path.exists(resolved):
+        if not os.path.isdir(resolved):
+            raise RuntimeError(f'outbox path exists and is not a directory: {resolved}')
+        if not is_maildir(resolved):
+            raise RuntimeError(
+                f'outbox path exists but is not a valid Maildir: {resolved}'
+            )
+    else:
+        try:
+            pathlib.Path(os.path.join(resolved, 'cur')).mkdir(parents=True)
+            pathlib.Path(os.path.join(resolved, 'new')).mkdir()
+            pathlib.Path(os.path.join(resolved, 'tmp')).mkdir()
+        except OSError as ex:
+            raise RuntimeError(
+                f'could not initialize outbox Maildir {resolved}: {ex}'
+            ) from ex
+
+    try:
+        probe = save_maildir_bytes(resolved, b'')
+        os.unlink(probe)
+    except OSError as ex:
+        raise RuntimeError(f'outbox Maildir is not writable: {resolved}: {ex}') from ex
+
+    return resolved
+
+
 def get_mailinfo(
     bmsg: bytes, scissors: bool = False
 ) -> Tuple[Dict[str, str], bytes, bytes]:
@@ -4993,6 +5075,27 @@ def patchwork_set_state(msgids: List[str], state: str) -> None:
                 logger.debug('Patchwork REST error: %s', ex)
 
 
+ArchiveCallbackT = Callable[[bytes, LoreSubject], None]
+
+
+def _archive_sent_message(
+    archive_cb: Optional[ArchiveCallbackT],
+    bdata: bytes,
+    lsubject: LoreSubject,
+) -> None:
+    if archive_cb is None:
+        return
+    try:
+        archive_cb(bdata, lsubject)
+    except Exception as ex:
+        logger.warning(
+            'WARNING: sent message was accepted, but b4 could not archive it '
+            'to the outbox: %s (%s)',
+            lsubject.full_subject,
+            ex,
+        )
+
+
 def send_mail(
     smtp: Union[smtplib.SMTP, smtplib.SMTP_SSL, List[str], None],
     msgs: Sequence[EmailMessage],
@@ -5003,6 +5106,7 @@ def send_mail(
     output_dir: Optional[str] = None,
     web_endpoint: Optional[str] = None,
     reflect: bool = False,
+    archive_cb: Optional[ArchiveCallbackT] = None,
 ) -> Optional[int]:
     tosend: List[Tuple[Set[str], bytes, LoreSubject]] = list()
     if output_dir is not None:
@@ -5082,6 +5186,8 @@ def send_mail(
         try:
             rdata = res.json()
             if rdata.get('result') == 'success':
+                for _destaddrs, bdata, lsubject in tosend:
+                    _archive_sent_message(archive_cb, bdata, lsubject)
                 return len(tosend)
         except Exception:
             logger.critical('Odd response from the endpoint: %s', res.text)
@@ -5106,7 +5212,8 @@ def send_mail(
         # the other types in the union.
         #
         # https://github.com/astral-sh/ty/issues/1578
-        smtps = ' '.join(smtp)  # ty:ignore[no-matching-overload]
+        smtp_cmd = [str(x) for x in smtp]
+        smtps = ' '.join(smtp_cmd)
         if reflect:
             logger.info('Reflecting via "%s"', smtps)
         else:
@@ -5114,13 +5221,14 @@ def send_mail(
         for destaddrs, bdata, lsubject in tosend:
             logger.info('  %s', lsubject.full_subject)
             if reflect:
-                cmdargs = list(smtp) + [envpair[1]]
+                cmdargs = smtp_cmd + [envpair[1]]
             else:
-                cmdargs = list(smtp) + list(destaddrs)
+                cmdargs = smtp_cmd + list(destaddrs)
             ecode, _out, err = _run_command(cmdargs, stdin=bdata)
             if ecode > 0:
                 raise RuntimeError('Error running %s: %s' % (smtps, err.decode()))
             sent += 1
+            _archive_sent_message(archive_cb, bdata, lsubject)
 
     elif smtp:
         for destaddrs, bdata, lsubject in tosend:
@@ -5132,6 +5240,7 @@ def send_mail(
             else:
                 smtp.sendmail(fromaddr, list(destaddrs), bdata)
             sent += 1
+            _archive_sent_message(archive_cb, bdata, lsubject)
 
     return sent
 

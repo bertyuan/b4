@@ -2526,6 +2526,16 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
     is_prep_branch(mustbe=True)
 
     config = b4.get_main_config()
+    outbox_maildir = None
+    outbox_cfg = config.get('outbox-maildir')
+    if outbox_cfg:
+        if not isinstance(outbox_cfg, str):
+            logger.critical(
+                'CRITICAL: b4.outbox-maildir must be a str, got %s',
+                type(outbox_cfg).__name__,
+            )
+            sys.exit(1)
+        outbox_maildir = b4.expand_maildir_path(outbox_cfg)
 
     tag_msg = None
     cl_msgid = None
@@ -2593,8 +2603,18 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
     myemail = str(usercfg.get('email', ''))
 
     seen: Set[str] = set()
-    excludes: Set[str] = set()
+    excludes: Set[str] = b4.get_excluded_addrs()
     pccs: defaultdict[str, List[Tuple[str, str]]] = defaultdict(list)
+    conf_me_too = config.get('send-me-too')
+    send_me_too_auto = conf_me_too is None
+    if cmdargs.not_me_too:
+        send_me_too = False
+    elif send_me_too_auto:
+        send_me_too = outbox_maildir is None
+    else:
+        send_me_too = str(conf_me_too).lower() not in {'no', 'n', 'false', '0', 'off'}
+    if not send_me_too:
+        excludes.add(myemail)
 
     if cmdargs.preview_to or cmdargs.no_trailer_to_cc:
         todests = list()
@@ -2626,11 +2646,6 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
                     todests.append(btr.addr)
                     continue
                 ccdests.append(btr.addr)
-
-        excludes = b4.get_excluded_addrs()
-        conf_me_too = str(config.get('send-me-too', 'yes')).lower()
-        if cmdargs.not_me_too or conf_me_too in {'no', 'n', 'false', '0'}:
-            excludes.add(myemail)
 
     tos = set()
     ccs = set()
@@ -2703,6 +2718,8 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
     if endpoint and cmdargs.preview_to:
         logger.critical('CRITICAL: cannot use the web endpoint with --preview-to')
         sys.exit(1)
+
+    outbox_archive_cb: Optional[b4.ArchiveCallbackT] = None
 
     # Give the user the last opportunity to bail out
     if not cmdargs.dryrun:
@@ -2777,6 +2794,20 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
                     logger.info('')
                     sys.exit(130)
 
+        if outbox_maildir:
+            try:
+                outbox_maildir = b4.prepare_outbox_maildir(outbox_maildir)
+            except RuntimeError as ex:
+                logger.critical('CRITICAL: %s', ex)
+                sys.exit(1)
+
+            prepared_outbox = outbox_maildir
+
+            def _archive_to_outbox(bdata: bytes, _lsubject: b4.LoreSubject) -> None:
+                b4.save_maildir_bytes(prepared_outbox, bdata)
+
+            outbox_archive_cb = _archive_to_outbox
+
         logger.info('---')
         b4.print_pretty_addrs(allto, 'To')
         b4.print_pretty_addrs(allcc, 'Cc')
@@ -2850,6 +2881,14 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
 
             else:
                 logger.info('  - via SMTP server %s', smtpserver)
+
+        if outbox_maildir:
+            logger.info('  - archive sent copies to Maildir: %s', outbox_maildir)
+            if send_me_too_auto and not send_me_too:
+                logger.info(
+                    '  - not send a separate copy to yourself '
+                    '(b4.outbox-maildir is set)'
+                )
 
         if not (cmdargs.reflect or cmdargs.resend or cmdargs.preview_to):
             logger.info('  - tag and reroll the series to the next revision')
@@ -2955,6 +2994,7 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
                 output_dir=cmdargs.output_dir,
                 web_endpoint=endpoint,
                 reflect=cmdargs.reflect,
+                archive_cb=outbox_archive_cb,
             )
         except RuntimeError as ex:
             logger.critical('CRITICAL: %s', ex)
@@ -2976,6 +3016,7 @@ def cmd_send(cmdargs: argparse.Namespace) -> None:
                 dryrun=cmdargs.dryrun,
                 output_dir=cmdargs.output_dir,
                 reflect=cmdargs.reflect,
+                archive_cb=outbox_archive_cb,
             )
         except RuntimeError as ex:
             logger.critical('CRITICAL: %s', ex)
