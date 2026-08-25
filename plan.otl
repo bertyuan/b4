@@ -71,6 +71,10 @@ v0.17
 	: Chuck Lever, https://msgid.link/20260324152805.88424-1-cel@kernel.org
 	: Cover/changelog/recipients as plain files under .git/b4-prep/<change-id>/
 	: Patch exists but needs review and a rebase against current master
+[X] Non-interactive cover/deps editing in `b4 prep`
+	: --show-cover/--cover-from-file and --show-deps/--deps-from-file, for
+	: scripts and agents that have no editor ("-" reads stdin)
+	: Blank input is fatal for the cover, but clears the list for deps
 [X] Migrate to liblore 0.9 scoped cancellation
 	: cancel_active() only affects in-flight requests; shutdown() is terminal (app exit)
 	: No sticky flag anymore, so the lore_request()/reset_cancel() hygiene layer is gone
