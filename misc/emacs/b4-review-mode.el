@@ -111,6 +111,20 @@ whole-line deletion worth a breadcrumb.")
   "Face for instruction lines (# ...)."
   :group 'b4-review)
 
+(defface b4-review-quote-background
+  '((t :inherit default :extend t))
+  "Background face for prefixed lines (`> ' quotes, `| ' external comments,
+`#' instructions), applied underneath their usual foreground colours so the
+background alone can be customized to set them off from your own text.
+`:extend t' is required for the background to fill out to the window edge
+on every line — without it, the fill stops at the last character."
+  :group 'b4-review)
+
+(defface b4-review-own-background
+  '((t :inherit default :extend t))
+  "Background face for the reviewer's own, unprefixed comment lines."
+  :group 'b4-review)
+
 (defvar b4-review-font-lock-keywords
   `(
     ;; Order matters — earlier rules take priority in Emacs font-lock
@@ -153,6 +167,17 @@ whole-line deletion worth a breadcrumb.")
 
     ;; Instruction lines
     ("^#.*$" (0 'b4-review-instruction))
+
+    ;; Full-line backgrounds, appended on top of the colours above.  Matching
+    ;; through the trailing newline puts a face on the newline character
+    ;; itself, and `:extend t' on these two faces (see their defface above)
+    ;; is what makes the display fill the rest of the line's width with that
+    ;; face's background instead of stopping at the last glyph.
+    ("^>.*\n?" (0 'b4-review-quote-background append))
+    ("^|.*\n?" (0 'b4-review-quote-background append))
+    ("^#.*\n?" (0 'b4-review-quote-background append))
+    ("^[^>|#\n].*\n?" (0 'b4-review-own-background append))
+    ("^\n" (0 'b4-review-own-background append))
     )
   "Font-lock keywords for `b4-review-mode'.")
 
