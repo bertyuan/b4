@@ -868,10 +868,7 @@ class ReviewApp(LoreNodeShutdownMixin, CheckRunnerMixin, App[None]):
             return
 
         if not review or not (
-            review.get('trailers')
-            or review.get('reply', '')
-            or review.get('comments')
-            or review.get('note', '')
+            review.get('trailers') or review.get('reply', '') or review.get('comments')
         ):
             viewer.write('[dim]No reply will be sent for this patch.[/dim]')
             return
