@@ -41,6 +41,35 @@ commit when you save and exit. The editor is selected following git's
 standard priority: ``$GIT_EDITOR``, then ``core.editor``, then ``$VISUAL``,
 then ``$EDITOR``, falling back to ``vi``.
 
+Editing the cover letter without an editor
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Sometimes there is nobody at the keyboard -- a script, a Makefile target,
+or an AI agent may be the one writing the cover letter. For those cases,
+b4 offers a non-interactive pair of commands::
+
+    b4 prep --show-cover > cover.txt
+    # edit cover.txt with whatever tool you like
+    b4 prep --cover-from-file cover.txt
+
+``--show-cover`` prints the cover letter exactly as ``--edit-cover``
+would show it in the editor, so the output can be modified and passed
+straight back in. Instead of a file name you can use ``-`` to read from
+stdin::
+
+    my-cover-generator | b4 prep --cover-from-file -
+
+Unlike the editor, which reasonably assumes that an empty buffer means
+"never mind", the non-interactive path treats blank input as a failure
+and exits without touching the cover letter. This way a generator that
+produced nothing can't silently wipe your work.
+
+The series dependencies have the same pair of commands,
+``b4 prep --show-deps`` and ``b4 prep --deps-from-file FILE``. There,
+blank input *is* meaningful: it clears all dependencies, which matches
+what emptying the buffer in ``--edit-deps`` does.
+
+.. versionadded:: v0.17
+
 .. _prep_cover_strategies:
 
 Cover letter strategies
@@ -392,6 +421,31 @@ modifying defaults for some of these flags.
   editor selection order as ``--edit-cover``).
 
   .. versionadded:: v0.14
+
+``--show-cover``
+  Prints the cover letter to stdout, exactly as ``--edit-cover`` would
+  show it in the editor, comments included.
+
+  .. versionadded:: v0.17
+
+``--cover-from-file FILE``
+  Replaces the cover letter with the contents of ``FILE``, or with what
+  it reads on stdin if ``FILE`` is ``-``. Blank input is an error.
+
+  .. versionadded:: v0.17
+
+``--show-deps``
+  Prints the series dependencies to stdout, one per line, without the
+  explanatory comments that ``--edit-deps`` shows.
+
+  .. versionadded:: v0.17
+
+``--deps-from-file FILE``
+  Replaces the series dependencies with the contents of ``FILE``, or
+  with what it reads on stdin if ``FILE`` is ``-``. Blank input clears
+  all dependencies.
+
+  .. versionadded:: v0.17
 
 ``--check-deps``
   Verifies that b4 can resolve all specified dependencies and that

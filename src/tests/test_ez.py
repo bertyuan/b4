@@ -1,6 +1,9 @@
+import io
 import logging
 import os
+import pathlib
 from email.message import EmailMessage
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, cast
 from unittest.mock import patch
 
@@ -1304,3 +1307,183 @@ def test_reroll_ignores_submodule_recurse(
     assert b4.git_revparse_tag(None, tagname), (
         f'reroll did not tag {tagname}: the scratch worktree recursed'
     )
+
+
+def _run_prep(*args: str) -> None:
+    """Drive `b4 prep` the way the command line would."""
+    parser = b4.command.setup_parser()
+    cmdargs = parser.parse_args(
+        ['--no-stdin', '--no-interactive', '--offline-mode', 'prep', *args]
+    )
+    b4.ez.cmd_prep(cmdargs)
+
+
+def _write(tmp_path: pathlib.Path, name: str, content: str) -> str:
+    fpath = tmp_path / name
+    fpath.write_text(content)
+    return str(fpath)
+
+
+def _as_stdin(bdata: bytes) -> Any:
+    """A stand-in for sys.stdin that only needs to satisfy .buffer.read()."""
+    return SimpleNamespace(buffer=io.BytesIO(bdata))
+
+
+NEW_COVER = 'A brand new subject\n\nAnd a brand new body.'
+
+
+def test_prep_cover_from_file_round_trip(
+    prepdir: str, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--cover-from-file stores what --show-cover prints back."""
+    fpath = _write(tmp_path, 'cover.txt', NEW_COVER + '\n')
+    _run_prep('--cover-from-file', fpath)
+
+    _run_prep('--show-cover')
+    assert capsys.readouterr().out.strip() == NEW_COVER
+
+    # And what we printed can be fed straight back in.
+    fpath = _write(tmp_path, 'again.txt', NEW_COVER + '\n')
+    _run_prep('--cover-from-file', fpath)
+    _run_prep('--show-cover')
+    assert capsys.readouterr().out.strip() == NEW_COVER
+
+
+def test_prep_cover_from_stdin(
+    prepdir: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A dash means stdin, which is the whole point of the feature."""
+    with patch('sys.stdin', _as_stdin(NEW_COVER.encode() + b'\n')):
+        _run_prep('--cover-from-file', '-')
+
+    _run_prep('--show-cover')
+    assert capsys.readouterr().out.strip() == NEW_COVER
+
+
+def test_prep_cover_from_file_normalizes_crlf(
+    prepdir: str, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CRLF input is canonicalized, same as the editor path does."""
+    fpath = _write(tmp_path, 'cover.txt', NEW_COVER.replace('\n', '\r\n') + '\r\n')
+    _run_prep('--cover-from-file', fpath)
+
+    _run_prep('--show-cover')
+    out = capsys.readouterr().out
+    assert '\r' not in out
+    assert out.strip() == NEW_COVER
+
+
+def test_prep_cover_from_file_rejects_blank(
+    prepdir: str, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Nobody is watching a pipe, so a blank cover is a failure, not a no-op.
+
+    (--edit-cover treats it as "user changed their mind", which is right for
+    a human who quit the editor and wrong for a generator that produced
+    nothing.)
+    """
+    before, _tracking = b4.ez.load_cover()
+    fpath = _write(tmp_path, 'blank.txt', '\n   \n')
+    with pytest.raises(SystemExit) as ex:
+        _run_prep('--cover-from-file', fpath)
+    assert ex.value.code == 1
+
+    after, _tracking = b4.ez.load_cover()
+    assert after == before
+
+
+def test_prep_cover_from_file_missing_file_is_fatal(
+    prepdir: str, tmp_path: pathlib.Path
+) -> None:
+    with pytest.raises(SystemExit) as ex:
+        _run_prep('--cover-from-file', str(tmp_path / 'does-not-exist.txt'))
+    assert ex.value.code == 1
+
+
+def test_prep_cover_from_file_unchanged_skips_rewrite(
+    prepdir_commit: str, tmp_path: pathlib.Path
+) -> None:
+    """Identical content must not churn the tracking commit.
+
+    Under the `commit` strategy, storing the cover rewrites the whole
+    series, so a no-op write is expensive as well as pointless.
+    """
+    cover, _tracking = b4.ez.load_cover()
+    pre_head = b4.git_revparse_obj('HEAD')
+
+    fpath = _write(tmp_path, 'same.txt', cover + '\n')
+    _run_prep('--cover-from-file', fpath)
+
+    assert b4.git_revparse_obj('HEAD') == pre_head
+
+
+def test_prep_cover_from_file_refuses_non_prep_branch(
+    gitdir: str, tmp_path: pathlib.Path
+) -> None:
+    fpath = _write(tmp_path, 'cover.txt', NEW_COVER)
+    with pytest.raises(SystemExit) as ex:
+        _run_prep('--cover-from-file', fpath)
+    assert ex.value.code == 1
+
+
+def test_prep_deps_from_file_round_trip(
+    prepdir: str,
+    tmp_path: pathlib.Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Comments and blanks are dropped; unknown entries warn but are kept."""
+    deps = (
+        '# this is a comment\n'
+        '\n'
+        'change-id: some-change-id:v2\n'
+        '  base-commit: abcdef1234  \n'
+        'bogus: entry\n'
+    )
+    fpath = _write(tmp_path, 'deps.txt', deps)
+    with caplog.at_level(logging.WARNING):
+        _run_prep('--deps-from-file', fpath)
+    assert 'Unrecognized entry: bogus: entry' in caplog.text
+
+    _run_prep('--show-deps')
+    # No DEPS_HELP banner in the output: it must be pipe-able back in.
+    assert capsys.readouterr().out == (
+        'change-id: some-change-id:v2\nbase-commit: abcdef1234\nbogus: entry\n'
+    )
+
+    _cover, tracking = b4.ez.load_cover()
+    assert tracking['series']['prerequisites'] == [
+        'change-id: some-change-id:v2',
+        'base-commit: abcdef1234',
+        'bogus: entry',
+    ]
+
+
+def test_prep_deps_from_stdin_blank_clears(
+    prepdir: str, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Blank deps input clears the list, matching --edit-deps semantics.
+
+    This is the one place blank input is meaningful, and it's the only way
+    to drop all dependencies without an editor.
+    """
+    fpath = _write(tmp_path, 'deps.txt', 'change-id: some-change-id:v2\n')
+    _run_prep('--deps-from-file', fpath)
+    _cover, tracking = b4.ez.load_cover()
+    assert tracking['series']['prerequisites']
+
+    with patch('sys.stdin', _as_stdin(b'\n# only a comment\n')):
+        _run_prep('--deps-from-file', '-')
+
+    _cover, tracking = b4.ez.load_cover()
+    assert tracking['series']['prerequisites'] == []
+    _run_prep('--show-deps')
+    assert capsys.readouterr().out == ''
+
+
+def test_prep_cover_and_deps_flags_are_mutually_exclusive() -> None:
+    parser = b4.command.setup_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(['prep', '--edit-cover', '--cover-from-file', '-'])
+    with pytest.raises(SystemExit):
+        parser.parse_args(['prep', '--show-deps', '--deps-from-file', '-'])

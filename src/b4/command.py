@@ -972,6 +972,28 @@ def setup_parser() -> argparse.ArgumentParser:
         help='Edit the series dependencies in the configured editor',
     )
     spp_g.add_argument(
+        '--show-cover',
+        action='store_true',
+        default=False,
+        help='Print the cover letter to stdout',
+    )
+    spp_g.add_argument(
+        '--cover-from-file',
+        metavar='FILE',
+        help='Set the cover letter from FILE (use "-" for stdin)',
+    )
+    spp_g.add_argument(
+        '--show-deps',
+        action='store_true',
+        default=False,
+        help='Print the series dependencies to stdout',
+    )
+    spp_g.add_argument(
+        '--deps-from-file',
+        metavar='FILE',
+        help='Set the series dependencies from FILE (use "-" for stdin)',
+    )
+    spp_g.add_argument(
         '--check-deps',
         action='store_true',
         default=False,

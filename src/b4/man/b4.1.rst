@@ -340,6 +340,11 @@ For options, see the output of ``b4 prep --help``, ``b4 trailers
   Edit the cover letter for the current series. This step isn't
   required for most single-patch submissions.
 
+``b4 prep --show-cover`` / ``b4 prep --cover-from-file FILE``
+  Print the cover letter to stdout, or replace it with the contents of
+  FILE (use ``-`` for stdin). Use these instead of ``--edit-cover``
+  when there is no human at the keyboard, e.g. from a script.
+
 ``b4 prep --auto-to-cc``
   Find all addresses that need to receive a copy of the patch series
   submission and add them to the cover letter.

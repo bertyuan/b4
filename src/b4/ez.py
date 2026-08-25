@@ -1159,6 +1159,101 @@ def claim_prep_branch(branch: Optional[str], no_interactive: bool = False) -> No
     logger.info('Claimed %s. The series is now committed by %s.', mybranch, myemail)
 
 
+def parse_deps(data: str) -> List[str]:
+    """Turn prerequisite text into a list of prerequisite entries.
+
+    Blank lines and comments are dropped, and anything that doesn't start
+    with a prefix we know about earns a warning -- but is still kept, since
+    it's the user's data and they may know something we don't.
+    """
+    prereqs = list()
+    recognized = {'patch-id', 'change-id', 'message-id', 'base-commit'}
+    for line in data.split('\n'):
+        entry = line.strip()
+        if not entry or entry.startswith('#'):
+            logger.debug('Ignoring: %s', entry)
+            continue
+        chunks = [x.strip() for x in entry.split(':')]
+        if chunks[0] not in recognized:
+            logger.warning('WARNING: Unrecognized entry: %s', entry)
+        prereqs.append(entry)
+
+    return prereqs
+
+
+def read_replacement(fpath: str, what: str, allow_blank: bool = False) -> str:
+    """Read replacement content from a file, or from stdin when fpath is '-'.
+
+    Unlike the editor paths, there is nobody here to notice that something
+    went wrong upstream of us, so an unreadable file is fatal, and so is
+    blank input unless the caller says that clearing the value is a
+    meaningful operation.
+    """
+    if fpath == '-':
+        bdata = sys.stdin.buffer.read()
+    else:
+        try:
+            with open(fpath, 'rb') as fh:
+                bdata = fh.read()
+        except OSError as ex:
+            logger.critical('CRITICAL: Could not read %s: %s', fpath, ex)
+            sys.exit(1)
+
+    # Match the editor path: mail-oriented content may arrive with CRLF
+    # endings, and everything downstream expects unix endings.
+    data = bdata.decode(errors='replace').replace('\r\n', '\n').strip()
+    if not data and not allow_blank:
+        logger.critical('CRITICAL: Refusing to set a blank %s.', what)
+        sys.exit(1)
+
+    return data
+
+
+def show_cover() -> None:
+    is_prep_branch(mustbe=True)
+    cover, _tracking = load_cover()
+    print(cover)
+
+
+def cover_from_file(fpath: str) -> None:
+    is_prep_branch(mustbe=True)
+    cover, tracking = load_cover()
+    new_cover = read_replacement(fpath, 'cover letter')
+    if new_cover == cover:
+        logger.info('Cover letter unchanged.')
+        return
+
+    store_cover(new_cover, tracking)
+    logger.info('Cover letter updated.')
+
+
+def show_deps() -> None:
+    is_prep_branch(mustbe=True)
+    _cover, tracking = load_cover()
+    for prereq in tracking['series'].get('prerequisites', list()):
+        print(prereq)
+
+
+def deps_from_file(fpath: str) -> None:
+    is_prep_branch(mustbe=True)
+    cover, tracking = load_cover()
+    # A blank file clears the dependencies, same as emptying the buffer in
+    # --edit-deps, and it's the only way to express that non-interactively.
+    new_data = read_replacement(fpath, 'dependency list', allow_blank=True)
+    prereqs = parse_deps(new_data)
+    if prereqs == tracking['series'].get('prerequisites', list()):
+        logger.info('Dependencies unchanged.')
+        return
+
+    tracking['series']['prerequisites'] = prereqs
+    logger.info('---')
+    if prereqs:
+        logger.info('Recorded %s dependencies.', len(prereqs))
+    else:
+        logger.info('Cleared all dependencies.')
+    store_cover(cover, tracking)
+
+
 def edit_cover() -> None:
     is_prep_branch(mustbe=True)
     cover, tracking = load_cover()
@@ -1192,18 +1287,7 @@ def edit_deps() -> None:
         logger.info('Dependencies unchanged.')
         return
     new_data = new_bdata.decode(errors='replace').strip()
-    prereqs = list()
-    recognized = {'patch-id', 'change-id', 'message-id', 'base-commit'}
-    if len(new_data):
-        for line in new_data.split('\n'):
-            entry = line.strip()
-            if not entry or entry.startswith('#'):
-                logger.debug('Ignoring: %s', entry)
-                continue
-            chunks = [x.strip() for x in entry.split(':')]
-            if chunks[0] not in recognized:
-                logger.warning('WARNING: Unrecognized entry: %s', entry)
-            prereqs.append(entry)
+    prereqs = parse_deps(new_data)
 
     tracking['series']['prerequisites'] = prereqs
     logger.info('---')
@@ -4192,6 +4276,18 @@ def cmd_prep(cmdargs: argparse.Namespace) -> None:
 
     if cmdargs.edit_deps:
         return edit_deps()
+
+    if cmdargs.show_cover:
+        return show_cover()
+
+    if cmdargs.cover_from_file:
+        return cover_from_file(cmdargs.cover_from_file)
+
+    if cmdargs.show_deps:
+        return show_deps()
+
+    if cmdargs.deps_from_file:
+        return deps_from_file(cmdargs.deps_from_file)
 
     if cmdargs.check_deps:
         return check_deps(cmdargs)
